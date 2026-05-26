@@ -28,7 +28,6 @@ if ($Help) {
     exit 0
 }
 
-$ErrorActionPreference = "Stop"
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $BridgePort = 18790
 $HealthPort = 18788
@@ -37,9 +36,12 @@ Write-Host ""
 Write-Host "=== R1 -> Hermes Bridge (x1 Setup) ===" -ForegroundColor Cyan
 Write-Host ""
 
-# ---- Check Python ----
+# ---- Check Python (no Stop on error yet -- we handle stderr manually) ----
+$oldEAP = $ErrorActionPreference
+$ErrorActionPreference = "Continue"
+
 try {
-    $pyVer = python --version 2>&1
+    $pyVer = & python --version 2>&1
     Write-Host "[OK] Python: $pyVer" -ForegroundColor Green
 } catch {
     Write-Host "[FAIL] Python not found! Install from https://python.org" -ForegroundColor Red
@@ -50,24 +52,31 @@ try {
 
 # ---- Install Dependencies ----
 Write-Host "[..] Checking Python dependencies..." -ForegroundColor Yellow
-$deps = @("websockets", "httpx", "qrcode")
+$deps = @("websockets", "httpx", "qrcode", "PIL")
 $missing = @()
 foreach ($dep in $deps) {
-    $result = python -c "import $dep; print('ok')" 2>&1
-    if ($result -ne "ok") {
-        $missing += $dep
-    }
+    $ok = $false
+    try {
+        $result = & python -c "import $dep; print('ok')" 2>&1 | Out-String
+        if ($result.Trim() -eq "ok") { $ok = $true }
+    } catch {}
+    if (-not $ok) { $missing += $dep }
 }
 if ($missing.Count -gt 0) {
     Write-Host "[..] Installing: $($missing -join ', ')..." -ForegroundColor Yellow
     foreach ($dep in $missing) {
-        python -m pip install $dep --quiet
+        $pipName = $dep
+        if ($dep -eq "PIL") { $pipName = "pillow" }
+        & python -m pip install $pipName --quiet 2>&1 | Out-Null
         Write-Host "     [OK] $dep" -ForegroundColor Green
     }
 } else {
     Write-Host "[OK] All dependencies found" -ForegroundColor Green
 }
 Write-Host ""
+
+# Restore strict error handling for the rest of the script
+$ErrorActionPreference = $oldEAP
 
 # ---- Auth Token ----
 $tokenFile = Join-Path $ScriptDir ".r1-auth-token"
