@@ -312,9 +312,18 @@ async def _handle_chat_send_stream(ws, request_id: str, params: dict, device_id:
         else:
             reply = await hermes_chat([{"role": "user", "content": text}])
 
+        # Stop thinking indicator FIRST
+        await ws.send(json.dumps({
+            "type": "event",
+            "event": "agent.thinking",
+            "payload": {"active": False},
+        }))
+
+        # Then send the response
         await ws.send(json.dumps({
             "type": "res", "id": request_id, "ok": True,
             "payload": {
+                "sessionKey": params.get("sessionKey", "main"),
                 "text": reply,
                 "messages": [{"role": "assistant", "content": reply}],
             },
