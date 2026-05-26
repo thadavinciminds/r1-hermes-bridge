@@ -310,7 +310,7 @@ async def _handle_chat_send_stream(ws, request_id: str, params: dict, device_id:
     }))
     log(f"  → ACK {request_id} (runId={run_id})")
 
-    # Lifecycle: start (R1 needs this to track the run)
+    # Send thinking event
     await ws.send(json.dumps({
         "type": "event",
         "event": "agent",
@@ -318,21 +318,6 @@ async def _handle_chat_send_stream(ws, request_id: str, params: dict, device_id:
         "payload": {
             "runId": run_id,
             "seq": 1,
-            "stream": "lifecycle",
-            "ts": started_at,
-            "data": {"phase": "start", "startedAt": started_at},
-            "sessionKey": session_key,
-        },
-    }))
-
-    # Send thinking event
-    await ws.send(json.dumps({
-        "type": "event",
-        "event": "agent",
-        "seq": 2,
-        "payload": {
-            "runId": run_id,
-            "seq": 2,
             "stream": "thinking",
             "ts": started_at,
             "data": {"text": "", "delta": ""},
@@ -351,29 +336,13 @@ async def _handle_chat_send_stream(ws, request_id: str, params: dict, device_id:
         await ws.send(json.dumps({
             "type": "event",
             "event": "agent",
-            "seq": 3,
+            "seq": 2,
             "payload": {
                 "runId": run_id,
-                "seq": 3,
+                "seq": 2,
                 "stream": "assistant",
                 "ts": now_ts,
                 "data": {"text": reply, "delta": reply},
-                "sessionKey": session_key,
-            },
-        }))
-
-        # Lifecycle: end — R1 needs this before sending the next chat.send
-        ended_at = int(time.time() * 1000)
-        await ws.send(json.dumps({
-            "type": "event",
-            "event": "agent",
-            "seq": 4,
-            "payload": {
-                "runId": run_id,
-                "seq": 4,
-                "stream": "lifecycle",
-                "ts": ended_at,
-                "data": {"phase": "end", "startedAt": started_at, "endedAt": ended_at},
                 "sessionKey": session_key,
             },
         }))
@@ -384,10 +353,10 @@ async def _handle_chat_send_stream(ws, request_id: str, params: dict, device_id:
         await ws.send(json.dumps({
             "type": "event",
             "event": "agent",
-            "seq": 3,
+            "seq": 2,
             "payload": {
                 "runId": run_id,
-                "seq": 3,
+                "seq": 2,
                 "stream": "error",
                 "ts": now_ts,
                 "data": {"error": str(e)},
