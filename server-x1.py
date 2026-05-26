@@ -269,10 +269,10 @@ async def handle_connect(ws, request_id: str, params: dict) -> dict:
     return {"type": "res", "id": request_id, "ok": True, "payload": hello_payload}
 
 
-async def handle_chat_send_stream(ws, request_id: str, params: dict, device_id: str):
+async def handle_chat_send_stream(ws, request_id: str, params: dict, device_id: str, next_seq_fn):
     """Handle chat.send — send to Hermes, get full response."""
     try:
-        await _handle_chat_send_stream(ws, request_id, params, device_id)
+        await _handle_chat_send_stream(ws, request_id, params, device_id, next_seq_fn)
     except Exception as e:
         log(f"❌ handle_chat_send crashed: {e}")
         traceback.print_exc()
@@ -284,7 +284,7 @@ async def handle_chat_send_stream(ws, request_id: str, params: dict, device_id: 
         except Exception:
             pass
 
-async def _handle_chat_send_stream(ws, request_id: str, params: dict, device_id: str):
+async def _handle_chat_send_stream(ws, request_id: str, params: dict, device_id: str, next_seq_fn):
     """Inner handler with full error trapping."""
     log(f"  ← ENTERED handler for {request_id}")
     text = params.get("message") or params.get("text", "")
@@ -314,7 +314,7 @@ async def _handle_chat_send_stream(ws, request_id: str, params: dict, device_id:
     await ws.send(json.dumps({
         "type": "event",
         "event": "agent",
-        "seq": 1,
+        "seq": next_seq_fn(),
         "payload": {
             "runId": run_id,
             "seq": 1,
@@ -336,7 +336,7 @@ async def _handle_chat_send_stream(ws, request_id: str, params: dict, device_id:
         await ws.send(json.dumps({
             "type": "event",
             "event": "agent",
-            "seq": 2,
+            "seq": next_seq_fn(),
             "payload": {
                 "runId": run_id,
                 "seq": 2,
@@ -354,7 +354,7 @@ async def _handle_chat_send_stream(ws, request_id: str, params: dict, device_id:
         await ws.send(json.dumps({
             "type": "event",
             "event": "agent",
-            "seq": 3,
+            "seq": next_seq_fn(),
             "payload": {
                 "runId": run_id,
                 "seq": 3,
@@ -367,7 +367,7 @@ async def _handle_chat_send_stream(ws, request_id: str, params: dict, device_id:
         await ws.send(json.dumps({
             "type": "event",
             "event": "agent",
-            "seq": 4,
+            "seq": next_seq_fn(),
             "payload": {
                 "runId": run_id,
                 "seq": 4,
@@ -384,7 +384,7 @@ async def _handle_chat_send_stream(ws, request_id: str, params: dict, device_id:
         await ws.send(json.dumps({
             "type": "event",
             "event": "agent",
-            "seq": 2,
+            "seq": next_seq_fn(),
             "payload": {
                 "runId": run_id,
                 "seq": 2,
@@ -398,7 +398,7 @@ async def _handle_chat_send_stream(ws, request_id: str, params: dict, device_id:
         await ws.send(json.dumps({
             "type": "event",
             "event": "agent",
-            "seq": 3,
+            "seq": next_seq_fn(),
             "payload": {
                 "runId": run_id,
                 "seq": 3,
@@ -411,7 +411,7 @@ async def _handle_chat_send_stream(ws, request_id: str, params: dict, device_id:
         await ws.send(json.dumps({
             "type": "event",
             "event": "agent",
-            "seq": 4,
+            "seq": next_seq_fn(),
             "payload": {
                 "runId": run_id,
                 "seq": 4,
@@ -469,6 +469,15 @@ async def r1_handler(websocket):
         device_info = connect_params.get("device", {})
         device_id = device_info.get("id", f"r1-{secrets.token_hex(8)}")
 
+        # ── Per-connection event sequence counter ──────────────────────────
+        # OpenClaw uses a monotonically increasing seq per-client across ALL
+        # events. Resetting to 1 each time confuses the R1 firmware.
+        seq_counter = [0]
+
+        def next_seq() -> int:
+            seq_counter[0] += 1
+            return seq_counter[0]
+
         # ── Step 3.5: Announce agent presence + start tick heartbeat ────────
         tick_task = None
         try:
@@ -521,7 +530,7 @@ async def r1_handler(websocket):
                 if method == "chat.send":
                     log(f"  ← DISPATCHING handler for {msg_id}")
                     try:
-                        await handle_chat_send_stream(websocket, msg_id, params, device_id)
+                        await handle_chat_send_stream(websocket, msg_id, params, device_id, next_seq)
                         log(f"  ← HANDLER DONE for {msg_id}")
                     except BaseException as e:
                         log(f"❌ chat.send FATAL ({type(e).__name__}): {e}")
