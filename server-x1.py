@@ -299,11 +299,27 @@ async def _handle_chat_send_stream(ws, request_id: str, params: dict, device_id:
 
     log(f"📩 Chat from R1: {text[:120]}")
 
-    # Send thinking indicator
+    # ── CRITICAL: immediate ACK with runId + status: "started" ────────
+    # The R1 shows "waiting" until it receives this. Without it, the
+    # R1 stays in a pending-request state and never transitions to
+    # "processing" / "responding."
+    run_id = f"run_{secrets.token_hex(8)}"
+    await ws.send(json.dumps({
+        "type": "res", "id": request_id, "ok": True,
+        "payload": {"runId": run_id, "status": "started"},
+    }))
+    log(f"  → ACK {request_id} (runId={run_id})")
+
+    # Send thinking indicator via agent.reply event (the R1 shows a spinner)
     await ws.send(json.dumps({
         "type": "event",
-        "event": "agent.thinking",
-        "payload": {"active": True},
+        "event": "agent.reply",
+        "payload": {
+            "runId": run_id,
+            "sessionKey": params.get("sessionKey", "main"),
+            "thinking": True,
+            "partial": True,
+        },
     }))
 
     try:
@@ -312,28 +328,32 @@ async def _handle_chat_send_stream(ws, request_id: str, params: dict, device_id:
         else:
             reply = await hermes_chat([{"role": "user", "content": text}])
 
-        # Stop thinking indicator FIRST
+        # Send the full response as an agent.reply event
         await ws.send(json.dumps({
             "type": "event",
-            "event": "agent.thinking",
-            "payload": {"active": False},
-        }))
-
-        # Then send the response
-        await ws.send(json.dumps({
-            "type": "res", "id": request_id, "ok": True,
+            "event": "agent.reply",
             "payload": {
+                "runId": run_id,
                 "sessionKey": params.get("sessionKey", "main"),
                 "text": reply,
                 "messages": [{"role": "assistant", "content": reply}],
+                "thinking": False,
+                "partial": False,
+                "final": True,
             },
         }))
         log(f"📤 Response: {reply[:100]}...")
     except Exception as e:
         log(f"❌ Hermes API error: {e}")
+        # Send error event
         await ws.send(json.dumps({
-            "type": "res", "id": request_id, "ok": False,
-            "error": {"code": "AGENT_ERROR", "message": str(e)},
+            "type": "event",
+            "event": "agent.error",
+            "payload": {
+                "runId": run_id,
+                "sessionKey": params.get("sessionKey", "main"),
+                "error": str(e),
+            },
         }))
 
 
