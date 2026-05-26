@@ -377,7 +377,29 @@ async def _handle_chat_send_stream(ws, request_id: str, params: dict, device_id:
                 "sessionKey": session_key,
             },
         }))
-        log("  → Sent: thinking=end + lifecycle=end")
+        # ── CRITICAL: chat.final event ──────────────────────────────────
+        # The R1 client waits for a "chat" event with state="final" before
+        # it allows the next chat.send. Without this, the R1 shows "waiting"
+        # indefinitely and never sends a second message.
+        await ws.send(json.dumps({
+            "type": "event",
+            "event": "chat",
+            "seq": next_seq_fn(),
+            "payload": {
+                "runId": run_id,
+                "sessionKey": session_key,
+                "seq": 5,
+                "state": "final",
+                "message": {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": reply}],
+                    "timestamp": end_ts,
+                },
+            },
+        }))
+        log("  → Sent: chat.final")
+
+        log("  → Sent: thinking=end + lifecycle=end + chat.final")
     except Exception as e:
         log(f"❌ Hermes API error: {e}")
         now_ts = int(time.time() * 1000)
@@ -421,6 +443,20 @@ async def _handle_chat_send_stream(ws, request_id: str, params: dict, device_id:
                 "sessionKey": session_key,
             },
         }))
+        # ── Send chat.final (error) so R1 accepts next message ──
+        await ws.send(json.dumps({
+            "type": "event",
+            "event": "chat",
+            "seq": next_seq_fn(),
+            "payload": {
+                "runId": run_id,
+                "sessionKey": session_key,
+                "seq": 5,
+                "state": "error",
+                "errorMessage": str(e),
+            },
+        }))
+        log("  → Sent: chat.final (error)")
 
 
 # ── WebSocket Connection Handler ────────────────────────────────────────────
