@@ -287,7 +287,7 @@ async def handle_chat_send_stream(ws, request_id: str, params: dict, device_id: 
 async def _handle_chat_send_stream(ws, request_id: str, params: dict, device_id: str):
     """Inner handler with full error trapping."""
     log(f"  ← ENTERED handler for {request_id}")
-    text = params.get("text", "")
+    text = params.get("message") or params.get("text", "")
     messages = params.get("messages", None)
 
     if not text and not messages:
@@ -545,7 +545,11 @@ async def main():
         print(f"  ✓ Bridge listening on ws://{BRIDGE_HOST}:{BRIDGE_PORT}")
         print()
         print("  Waiting for Rabbit R1 connections...")
-        await asyncio.get_running_loop().create_future()
+        stop_event = asyncio.Event()
+        try:
+            await stop_event.wait()
+        except asyncio.CancelledError:
+            pass
 
 
 if __name__ == "__main__":
