@@ -84,33 +84,51 @@ if (Test-Path $tokenFile) {
     $token = (Get-Content $tokenFile -Raw).Trim()
 }
 if (-not $token -or $token.Length -eq 0) {
+    $rng = New-Object System.Security.Cryptography.RNGCryptoServiceProvider
     $bytes = New-Object byte[] 32
-    [System.Security.Cryptography.RandomNumberGenerator]::Fill($bytes)
+    $rng.GetBytes($bytes)
     $token = -join ($bytes | ForEach-Object { $_.ToString("x2") })
+    $rng.Dispose()
     Set-Content -Path $tokenFile -Value $token -NoNewline
 }
 Write-Host "[OK] Auth token: $($token.Substring(0, [Math]::Min(16, $token.Length)))..." -ForegroundColor Blue
 Write-Host ""
 
-# ---- Detect WiFi IP ----
+# ---- Detect WiFi IP (parse ipconfig -- works on all Windows versions) ----
 $wifiIP = $null
 try {
-    $allIPs = Get-NetIPAddress -AddressFamily IPv4 | Where-Object {
-        $_.IPAddress -like "192.168.*" -or
-        $_.IPAddress -like "10.*" -or
-        $_.IPAddress -like "172.16.*"
-    } | Sort-Object -Property InterfaceMetric
-
-    if ($allIPs.Count -gt 0) {
-        $wifi = $allIPs | Where-Object { $_.InterfaceAlias -match "wi-?fi|wlan|wireless" }
-        if ($wifi) { $allIPs = $wifi }
-        $wifiIP = ($allIPs | Select-Object -First 1).IPAddress
+    $ipconfig = & ipconfig 2>$null | Out-String
+    # Find all "IPv4 Address" lines and pick the first non-APIPA address
+    $lines = $ipconfig -split "`r`n"
+    $candidates = @()
+    for ($i = 0; $i -lt $lines.Count; $i++) {
+        if ($lines[$i] -match "IPv4 Address.*:\s*(\d+\.\d+\.\d+\.\d+)") {
+            $ip = $matches[1]
+            if ($ip -notmatch "^169\.254\." -and $ip -notmatch "^127\.") {
+                $candidates += $ip
+            }
+        }
+        # Also try the older "IP Address" format
+        if ($lines[$i] -match "IP Address[^:]*:\s*(\d+\.\d+\.\d+\.\d+)") {
+            $ip = $matches[1]
+            if ($ip -notmatch "^169\.254\." -and $ip -notmatch "^127\.") {
+                $candidates += $ip
+            }
+        }
+    }
+    # Prefer 192.168.x.x or 10.x.x.x (typical WiFi LAN)
+    $lan = $candidates | Where-Object { $_ -match "^(192\.168\.|10\.|172\.(1[6-9]|2\d|3[01])\.)" }
+    if ($lan) { $candidates = $lan }
+    if ($candidates.Count -gt 0) {
+        $wifiIP = $candidates[0]
     }
 } catch {}
 
 if (-not $wifiIP) {
     $wifiIP = "192.168.1.100"
     Write-Host "[WARN] Could not detect WiFi IP. Using $wifiIP" -ForegroundColor Yellow
+    Write-Host "       If wrong, find your IP with: ipconfig" -ForegroundColor Yellow
+    Write-Host "       Then edit .qr-payload.json and re-run: python qrgen.py r1-hermes-qr.png .qr-payload.json" -ForegroundColor Yellow
 } else {
     Write-Host "[OK] WiFi IP: $wifiIP" -ForegroundColor Green
 }
