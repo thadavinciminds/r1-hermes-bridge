@@ -269,7 +269,7 @@ async def handle_connect(ws, request_id: str, params: dict) -> dict:
 
 
 async def handle_chat_send_stream(ws, request_id: str, params: dict, device_id: str):
-    """Handle chat.send — stream Hermes response to R1."""
+    """Handle chat.send — send to Hermes, get full response (non-streaming to avoid blocking WS pings)."""
     text = params.get("text", "")
     messages = params.get("messages", None)
 
@@ -282,13 +282,18 @@ async def handle_chat_send_stream(ws, request_id: str, params: dict, device_id: 
 
     log(f"📩 Chat from R1: {text[:120]}")
 
+    # Send thinking indicator
+    await ws.send(json.dumps({
+        "type": "event",
+        "event": "agent.thinking",
+        "payload": {"active": True},
+    }))
+
     try:
         if messages:
-            reply = await hermes_chat_stream(messages, ws, request_id)
+            reply = await hermes_chat(messages)
         else:
-            reply = await hermes_chat_stream(
-                [{"role": "user", "content": text}], ws, request_id
-            )
+            reply = await hermes_chat([{"role": "user", "content": text}])
 
         await ws.send(json.dumps({
             "type": "res", "id": request_id, "ok": True,
