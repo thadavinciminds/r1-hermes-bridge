@@ -310,7 +310,7 @@ async def _handle_chat_send_stream(ws, request_id: str, params: dict, device_id:
     }))
     log(f"  → ACK {request_id} (runId={run_id})")
 
-    # Send thinking event
+    # Send thinking: started
     await ws.send(json.dumps({
         "type": "event",
         "event": "agent",
@@ -320,7 +320,7 @@ async def _handle_chat_send_stream(ws, request_id: str, params: dict, device_id:
             "seq": 1,
             "stream": "thinking",
             "ts": started_at,
-            "data": {"text": "", "delta": ""},
+            "data": {"text": "", "delta": "", "active": True},
             "sessionKey": session_key,
         },
     }))
@@ -347,6 +347,37 @@ async def _handle_chat_send_stream(ws, request_id: str, params: dict, device_id:
             },
         }))
         log(f"📤 Response: {reply[:100]}...")
+
+        # CRITICAL: End thinking state + lifecycle end — R1 won't accept next
+        # chat.send until it receives lifecycle phase=end
+        end_ts = int(time.time() * 1000)
+        await ws.send(json.dumps({
+            "type": "event",
+            "event": "agent",
+            "seq": 3,
+            "payload": {
+                "runId": run_id,
+                "seq": 3,
+                "stream": "thinking",
+                "ts": end_ts,
+                "data": {"text": "", "delta": "", "active": False},
+                "sessionKey": session_key,
+            },
+        }))
+        await ws.send(json.dumps({
+            "type": "event",
+            "event": "agent",
+            "seq": 4,
+            "payload": {
+                "runId": run_id,
+                "seq": 4,
+                "stream": "lifecycle",
+                "ts": end_ts,
+                "data": {"phase": "end", "endedAt": end_ts},
+                "sessionKey": session_key,
+            },
+        }))
+        log("  → Sent: thinking=end + lifecycle=end")
     except Exception as e:
         log(f"❌ Hermes API error: {e}")
         now_ts = int(time.time() * 1000)
@@ -360,6 +391,33 @@ async def _handle_chat_send_stream(ws, request_id: str, params: dict, device_id:
                 "stream": "error",
                 "ts": now_ts,
                 "data": {"error": str(e)},
+                "sessionKey": session_key,
+            },
+        }))
+        # End thinking + lifecycle error so R1 accepts next message
+        await ws.send(json.dumps({
+            "type": "event",
+            "event": "agent",
+            "seq": 3,
+            "payload": {
+                "runId": run_id,
+                "seq": 3,
+                "stream": "thinking",
+                "ts": now_ts,
+                "data": {"text": "", "delta": "", "active": False},
+                "sessionKey": session_key,
+            },
+        }))
+        await ws.send(json.dumps({
+            "type": "event",
+            "event": "agent",
+            "seq": 4,
+            "payload": {
+                "runId": run_id,
+                "seq": 4,
+                "stream": "lifecycle",
+                "ts": now_ts,
+                "data": {"phase": "error", "endedAt": now_ts, "error": str(e)},
                 "sessionKey": session_key,
             },
         }))
