@@ -286,6 +286,7 @@ async def handle_chat_send_stream(ws, request_id: str, params: dict, device_id: 
 
 async def _handle_chat_send_stream(ws, request_id: str, params: dict, device_id: str):
     """Inner handler with full error trapping."""
+    log(f"  ← ENTERED handler for {request_id}")
     text = params.get("text", "")
     messages = params.get("messages", None)
 
@@ -414,14 +415,17 @@ async def r1_handler(websocket):
             method = msg.get("method", "")
             params = msg.get("params", {})
 
-            log(f"  ← {msg_type}/{method or msg.get('event', '?')} id={msg_id}")
+            log(f"  ← {msg_type}/{method or msg.get('event', '?')} id={msg_id}" +
+                (f" text={params.get('text', '')[:80]}" if method == "chat.send" else ""))
 
             if msg_type == "req":
                 if method == "chat.send":
+                    log(f"  ← DISPATCHING handler for {msg_id}")
                     try:
                         await handle_chat_send_stream(websocket, msg_id, params, device_id)
-                    except Exception as e:
-                        log(f"❌ chat.send handler crashed: {e}")
+                        log(f"  ← HANDLER DONE for {msg_id}")
+                    except BaseException as e:
+                        log(f"❌ chat.send FATAL ({type(e).__name__}): {e}")
                         traceback.print_exc()
 
                 elif method == "chat.history":
