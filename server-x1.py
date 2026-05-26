@@ -240,8 +240,8 @@ async def handle_connect(ws, request_id: str, params: dict) -> dict:
                 "health", "status",
             ],
             "events": [
-                "agent.message", "agent.thinking", "agent.error",
-                "chat.message", "presence", "tick", "heartbeat",
+                "agent", "chat", "chat.side_result",
+                "presence", "tick", "heartbeat", "talk.event",
                 "node.presence",
             ],
         },
@@ -289,6 +289,7 @@ async def _handle_chat_send_stream(ws, request_id: str, params: dict, device_id:
     log(f"  ← ENTERED handler for {request_id}")
     text = params.get("message") or params.get("text", "")
     messages = params.get("messages", None)
+    session_key = params.get("sessionKey", "main")
 
     if not text and not messages:
         await ws.send(json.dumps({
@@ -299,10 +300,8 @@ async def _handle_chat_send_stream(ws, request_id: str, params: dict, device_id:
 
     log(f"📩 Chat from R1: {text[:120]}")
 
-    # ── CRITICAL: immediate ACK with runId + status: "started" ────────
-    # The R1 shows "waiting" until it receives this. Without it, the
-    # R1 stays in a pending-request state and never transitions to
-    # "processing" / "responding."
+    # CRITICAL: immediate ACK with runId + status: "started"
+    # The R1 shows "waiting" until it receives this.
     run_id = f"run_{secrets.token_hex(8)}"
     await ws.send(json.dumps({
         "type": "res", "id": request_id, "ok": True,
@@ -310,15 +309,19 @@ async def _handle_chat_send_stream(ws, request_id: str, params: dict, device_id:
     }))
     log(f"  → ACK {request_id} (runId={run_id})")
 
-    # Send thinking indicator via agent.reply event (the R1 shows a spinner)
+    # Send thinking event (matches OpenClaw agent event format)
+    now_ts = int(time.time() * 1000)
     await ws.send(json.dumps({
         "type": "event",
-        "event": "agent.reply",
+        "event": "agent",
+        "seq": 1,
         "payload": {
             "runId": run_id,
-            "sessionKey": params.get("sessionKey", "main"),
-            "thinking": True,
-            "partial": True,
+            "seq": 1,
+            "stream": "thinking",
+            "ts": now_ts,
+            "data": {"text": "", "delta": ""},
+            "sessionKey": session_key,
         },
     }))
 
@@ -328,31 +331,36 @@ async def _handle_chat_send_stream(ws, request_id: str, params: dict, device_id:
         else:
             reply = await hermes_chat([{"role": "user", "content": text}])
 
-        # Send the full response as an agent.reply event
+        now_ts = int(time.time() * 1000)
+        # Send the full response as assistant event (matches OpenClaw agent event format)
         await ws.send(json.dumps({
             "type": "event",
-            "event": "agent.reply",
+            "event": "agent",
+            "seq": 2,
             "payload": {
                 "runId": run_id,
-                "sessionKey": params.get("sessionKey", "main"),
-                "text": reply,
-                "messages": [{"role": "assistant", "content": reply}],
-                "thinking": False,
-                "partial": False,
-                "final": True,
+                "seq": 2,
+                "stream": "assistant",
+                "ts": now_ts,
+                "data": {"text": reply, "delta": reply},
+                "sessionKey": session_key,
             },
         }))
         log(f"📤 Response: {reply[:100]}...")
     except Exception as e:
         log(f"❌ Hermes API error: {e}")
-        # Send error event
+        now_ts = int(time.time() * 1000)
         await ws.send(json.dumps({
             "type": "event",
-            "event": "agent.error",
+            "event": "agent",
+            "seq": 3,
             "payload": {
                 "runId": run_id,
-                "sessionKey": params.get("sessionKey", "main"),
-                "error": str(e),
+                "seq": 3,
+                "stream": "error",
+                "ts": now_ts,
+                "data": {"error": str(e)},
+                "sessionKey": session_key,
             },
         }))
 
