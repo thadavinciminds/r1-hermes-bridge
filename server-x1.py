@@ -303,14 +303,14 @@ async def _handle_chat_send_stream(ws, request_id: str, params: dict, device_id:
     # CRITICAL: immediate ACK with runId + status: "started"
     # The R1 shows "waiting" until it receives this.
     run_id = f"run_{secrets.token_hex(8)}"
+    started_at = int(time.time() * 1000)
     await ws.send(json.dumps({
         "type": "res", "id": request_id, "ok": True,
         "payload": {"runId": run_id, "status": "started"},
     }))
     log(f"  → ACK {request_id} (runId={run_id})")
 
-    # Send thinking event (matches OpenClaw agent event format)
-    now_ts = int(time.time() * 1000)
+    # Lifecycle: start (R1 needs this to track the run)
     await ws.send(json.dumps({
         "type": "event",
         "event": "agent",
@@ -318,8 +318,23 @@ async def _handle_chat_send_stream(ws, request_id: str, params: dict, device_id:
         "payload": {
             "runId": run_id,
             "seq": 1,
+            "stream": "lifecycle",
+            "ts": started_at,
+            "data": {"phase": "start", "startedAt": started_at},
+            "sessionKey": session_key,
+        },
+    }))
+
+    # Send thinking event
+    await ws.send(json.dumps({
+        "type": "event",
+        "event": "agent",
+        "seq": 2,
+        "payload": {
+            "runId": run_id,
+            "seq": 2,
             "stream": "thinking",
-            "ts": now_ts,
+            "ts": started_at,
             "data": {"text": "", "delta": ""},
             "sessionKey": session_key,
         },
@@ -332,17 +347,33 @@ async def _handle_chat_send_stream(ws, request_id: str, params: dict, device_id:
             reply = await hermes_chat([{"role": "user", "content": text}])
 
         now_ts = int(time.time() * 1000)
-        # Send the full response as assistant event (matches OpenClaw agent event format)
+        # Send the full response as assistant event
         await ws.send(json.dumps({
             "type": "event",
             "event": "agent",
-            "seq": 2,
+            "seq": 3,
             "payload": {
                 "runId": run_id,
-                "seq": 2,
+                "seq": 3,
                 "stream": "assistant",
                 "ts": now_ts,
                 "data": {"text": reply, "delta": reply},
+                "sessionKey": session_key,
+            },
+        }))
+
+        # Lifecycle: end — R1 needs this before sending the next chat.send
+        ended_at = int(time.time() * 1000)
+        await ws.send(json.dumps({
+            "type": "event",
+            "event": "agent",
+            "seq": 4,
+            "payload": {
+                "runId": run_id,
+                "seq": 4,
+                "stream": "lifecycle",
+                "ts": ended_at,
+                "data": {"phase": "end", "startedAt": started_at, "endedAt": ended_at},
                 "sessionKey": session_key,
             },
         }))
