@@ -152,29 +152,20 @@ function New-QRCode {
     Write-Host ""
     
     $qrPath = Join-Path $ScriptDir "r1-hermes-qr.png"
+    $payloadFile = Join-Path $ScriptDir ".qr-payload.json"
     
-    # Generate QR as PNG
-    python -c @"
-import qrcode, json
-payload = json.loads('''$payload''' if isinstance('''$payload''', str) else '''$payload''')
-payload = '''$payload'''
-img = qrcode.make(payload)
-img.save(r'$qrPath')
-print(f'Saved: $qrPath ({img.size[0]}x{img.size[1]})')
-"@
+    # Write payload to temp file so special chars don't break shell arg passing
+    Set-Content -Path $payloadFile -Value $payload -NoNewline
     
+    # Generate QR using standalone Python script (avoids quote-escaping hell)
+    $qrgen = Join-Path $ScriptDir "qrgen.py"
+    python $qrgen $qrPath $payloadFile
+    
+    # Clean up temp file
+    Remove-Item $payloadFile -ErrorAction SilentlyContinue
+
     Write-Host "  ✓ QR code saved: $qrPath" -ForegroundColor Green
     Write-Host ""
-    
-    # Try to display the QR in the terminal
-    python -c @"
-import qrcode, json
-payload = '''$payload'''
-qr = qrcode.QRCode(box_size=2, border=2)
-qr.add_data(payload)
-qr.make(fit=True)
-qr.print_ascii()
-"@ 2>$null
     
     # Open the image
     Start-Process $qrPath
