@@ -156,7 +156,16 @@ async def handle_connect(ws, request_id: str, params: dict) -> dict:
     role = params.get("role", "node")
 
     token = auth.get("token", "")
-    if token != AUTH_TOKEN:
+
+    # Accept either the original pairing token OR any previously issued device token
+    valid_tokens = {AUTH_TOKEN}
+    for d in devices.values():
+        dt = d.get("device_token")
+        if dt:
+            valid_tokens.add(dt)
+
+    if token not in valid_tokens:
+        log(f"  ← Auth token mismatch (got {token[:12]}..., expected one of {len(valid_tokens)} tokens)")
         return {
             "type": "res", "id": request_id, "ok": False,
             "error": {"code": "UNAUTHORIZED", "message": "Invalid auth token"},
