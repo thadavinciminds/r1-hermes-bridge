@@ -22,6 +22,7 @@ import os
 import secrets
 import sys
 import time
+import traceback
 from datetime import datetime, timezone
 
 import httpx
@@ -269,7 +270,22 @@ async def handle_connect(ws, request_id: str, params: dict) -> dict:
 
 
 async def handle_chat_send_stream(ws, request_id: str, params: dict, device_id: str):
-    """Handle chat.send — send to Hermes, get full response (non-streaming to avoid blocking WS pings)."""
+    """Handle chat.send — send to Hermes, get full response."""
+    try:
+        await _handle_chat_send_stream(ws, request_id, params, device_id)
+    except Exception as e:
+        log(f"❌ handle_chat_send crashed: {e}")
+        traceback.print_exc()
+        try:
+            await ws.send(json.dumps({
+                "type": "res", "id": request_id, "ok": False,
+                "error": {"code": "AGENT_ERROR", "message": str(e)},
+            }))
+        except Exception:
+            pass
+
+async def _handle_chat_send_stream(ws, request_id: str, params: dict, device_id: str):
+    """Inner handler with full error trapping."""
     text = params.get("text", "")
     messages = params.get("messages", None)
 
@@ -402,7 +418,11 @@ async def r1_handler(websocket):
 
             if msg_type == "req":
                 if method == "chat.send":
-                    await handle_chat_send_stream(websocket, msg_id, params, device_id)
+                    try:
+                        await handle_chat_send_stream(websocket, msg_id, params, device_id)
+                    except Exception as e:
+                        log(f"❌ chat.send handler crashed: {e}")
+                        traceback.print_exc()
 
                 elif method == "chat.history":
                     await websocket.send(json.dumps({
