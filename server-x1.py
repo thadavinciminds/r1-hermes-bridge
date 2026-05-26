@@ -51,6 +51,29 @@ else:
     with open(TOKEN_FILE, "w") as f:
         f.write(AUTH_TOKEN)
 
+# Persisted device tokens (so reconnects survive bridge restarts)
+DEVICE_TOKENS_FILE = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), ".r1-device-tokens.json"
+)
+
+
+def load_device_tokens() -> list:
+    """Load previously issued device tokens from disk."""
+    if os.path.exists(DEVICE_TOKENS_FILE):
+        with open(DEVICE_TOKENS_FILE) as f:
+            return json.load(f)
+    return []
+
+
+def save_device_token(token: str):
+    """Add a device token to the persisted list."""
+    tokens = load_device_tokens()
+    if token not in tokens:
+        tokens.append(token)
+        with open(DEVICE_TOKENS_FILE, "w") as f:
+            json.dump(tokens, f)
+
+
 # ── State ───────────────────────────────────────────────────────────────────
 devices: dict = {}
 pending_requests: dict = {}
@@ -157,19 +180,26 @@ async def handle_connect(ws, request_id: str, params: dict) -> dict:
 
     token = auth.get("token", "")
 
-    # Accept either the original pairing token OR any previously issued device token
+    # Accept pairing token OR any previously issued device token (persisted + in-memory)
     valid_tokens = {AUTH_TOKEN}
+    valid_tokens.update(load_device_tokens())  # always from disk (fresh after saves)
     for d in devices.values():
         dt = d.get("device_token")
         if dt:
             valid_tokens.add(dt)
 
     if token not in valid_tokens:
-        log(f"  ← Auth token mismatch (got {token[:12]}..., expected one of {len(valid_tokens)} tokens)")
-        return {
-            "type": "res", "id": request_id, "ok": False,
-            "error": {"code": "UNAUTHORIZED", "message": "Invalid auth token"},
-        }
+        bootstrap = (len(devices) == 0 and len(load_device_tokens()) == 0)
+        if bootstrap:
+            log(f"  ← Bootstrap: accepting unseen token {token[:16]}... (no prior devices)")
+            # Save both the incoming token and the one we're about to issue
+            save_device_token(token)
+        else:
+            log(f"  ← Auth token mismatch (got {token[:16]}..., expected one of {len(valid_tokens)} tokens)")
+            return {
+                "type": "res", "id": request_id, "ok": False,
+                "error": {"code": "UNAUTHORIZED", "message": "Invalid auth token"},
+            }
 
     device_id = device_info.get("id", f"r1-{secrets.token_hex(8)}")
     display_name = f"Rabbit R1 ({client_info.get('platform', 'unknown')})"
@@ -181,6 +211,7 @@ async def handle_connect(ws, request_id: str, params: dict) -> dict:
         pending_requests[pairing_request_id] = device_id
 
     device_token = f"hdt_{secrets.token_hex(32)}"
+    save_device_token(device_token)
 
     devices[device_id] = {
         "ws": ws,
