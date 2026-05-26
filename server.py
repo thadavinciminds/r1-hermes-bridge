@@ -320,47 +320,128 @@ async def handle_chat_send(ws, request_id: str, params: dict, device_id: str) ->
         }
 
 
-async def handle_chat_send_stream(ws, request_id: str, params: dict, device_id: str):
-    """Handle chat.send with streaming — stream Hermes response to R1."""
-    text = params.get("text", "")
+async def handle_chat_send_stream(ws, request_id: str, params: dict, device_id: str, next_seq_fn):
+    """Handle chat.send — full OpenClaw protocol: ACK → thinking → reply → lifecycle → chat.final."""
+    text = params.get("message") or params.get("text", "")
     messages = params.get("messages", None)
+    session_key = params.get("sessionKey", "main")
 
     if not text and not messages:
         await ws.send(json.dumps({
-            "type": "res",
-            "id": request_id,
-            "ok": False,
+            "type": "res", "id": request_id, "ok": False,
             "error": {"code": "INVALID_PARAMS", "message": "text or messages required"},
         }))
         return
 
-    print(f"  📩 Stream from {device_id[:12]}...: {text[:100]}")
+    print(f"  📩 Chat from {device_id[:12]}...: {text[:120]}")
+
+    # ── ACK with runId + status: "started" ───────────────────────────────
+    run_id = f"run_{secrets.token_hex(8)}"
+    started_at = int(time.time() * 1000)
+    await ws.send(json.dumps({
+        "type": "res", "id": request_id, "ok": True,
+        "payload": {"runId": run_id, "status": "started"},
+    }))
+
+    # ── agent.thinking (active=true) ─────────────────────────────────────
+    await ws.send(json.dumps({
+        "type": "event",
+        "event": "agent",
+        "seq": next_seq_fn(),
+        "payload": {
+            "runId": run_id, "seq": 1,
+            "stream": "thinking",
+            "ts": started_at,
+            "data": {"text": "", "delta": "", "active": True},
+            "sessionKey": session_key,
+        },
+    }))
 
     try:
         if messages:
-            reply = await hermes_chat_stream(messages, ws, request_id)
+            reply = await hermes_chat(messages)
         else:
-            reply = await hermes_chat_stream(
-                [{"role": "user", "content": text}], ws, request_id
-            )
+            reply = await hermes_chat([{"role": "user", "content": text}])
 
-        # Send final response
+        now_ts = int(time.time() * 1000)
+        end_ts = int(time.time() * 1000)
+
+        # ── agent.assistant ──────────────────────────────────────────
         await ws.send(json.dumps({
-            "type": "res",
-            "id": request_id,
-            "ok": True,
+            "type": "event",
+            "event": "agent",
+            "seq": next_seq_fn(),
             "payload": {
-                "text": reply,
-                "messages": [{"role": "assistant", "content": reply}],
+                "runId": run_id, "seq": 2,
+                "stream": "assistant",
+                "ts": now_ts,
+                "data": {"text": reply, "delta": reply},
+                "sessionKey": session_key,
             },
         }))
-    except Exception as e:
-        print(f"  ❌ Hermes stream error: {e}")
+        print(f"  📤 Response: {reply[:100]}...")
+
+        # ── agent.thinking (active=false) ────────────────────────────
         await ws.send(json.dumps({
-            "type": "res",
-            "id": request_id,
-            "ok": False,
-            "error": {"code": "AGENT_ERROR", "message": str(e)},
+            "type": "event",
+            "event": "agent",
+            "seq": next_seq_fn(),
+            "payload": {
+                "runId": run_id, "seq": 3,
+                "stream": "thinking",
+                "ts": end_ts,
+                "data": {"text": "", "delta": "", "active": False},
+                "sessionKey": session_key,
+            },
+        }))
+
+        # ── agent.lifecycle (phase=end) ──────────────────────────────
+        await ws.send(json.dumps({
+            "type": "event",
+            "event": "agent",
+            "seq": next_seq_fn(),
+            "payload": {
+                "runId": run_id, "seq": 4,
+                "stream": "lifecycle",
+                "ts": end_ts,
+                "data": {"phase": "end", "endedAt": end_ts},
+                "sessionKey": session_key,
+            },
+        }))
+
+        # ── chat.final event ─────────────────────────────────────────
+        await ws.send(json.dumps({
+            "type": "event",
+            "event": "chat",
+            "seq": next_seq_fn(),
+            "payload": {
+                "runId": run_id,
+                "sessionKey": session_key,
+                "seq": 1,
+                "state": "final",
+                "message": {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": reply}],
+                    "timestamp": end_ts,
+                },
+            },
+        }))
+        print("  → Sent: ACK + agent.thinking(start) + agent.assistant + thinking(end) + lifecycle(end) + chat.final")
+
+    except Exception as e:
+        print(f"  ❌ Hermes error: {e}")
+        now_ts = int(time.time() * 1000)
+        await ws.send(json.dumps({
+            "type": "event",
+            "event": "chat",
+            "seq": next_seq_fn(),
+            "payload": {
+                "runId": run_id,
+                "sessionKey": session_key,
+                "seq": 1,
+                "state": "error",
+                "errorMessage": str(e),
+            },
         }))
 
 
@@ -415,6 +496,12 @@ async def r1_handler(websocket):
         device_id = device_info.get("id", f"r1-{secrets.token_hex(8)}")
         print(f"  ✓ R1 connected: {device_id[:16]}...")
 
+        # Per-connection monotonically increasing seq for events
+        _seq_counter = [0]
+        def next_seq():
+            _seq_counter[0] += 1
+            return _seq_counter[0]
+
         # Step 4: Message loop — handle subsequent messages
         async for raw in websocket:
             try:
@@ -432,7 +519,7 @@ async def r1_handler(websocket):
                 print(f"  ← RPC: {method} id={msg_id}")
 
                 if method == "chat.send":
-                    await handle_chat_send_stream(websocket, msg_id, params, device_id)
+                    await handle_chat_send_stream(websocket, msg_id, params, device_id, next_seq)
 
                 elif method == "chat.history":
                     await websocket.send(json.dumps({
