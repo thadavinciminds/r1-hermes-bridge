@@ -263,7 +263,7 @@ async def handle_connect(ws, request_id: str, params: dict) -> dict:
         "policy": {
             "maxPayload": 26214400,
             "maxBufferedBytes": 52428800,
-            "tickIntervalMs": 15000,
+            "tickIntervalMs": 8000,
         },
         "pluginSurfaceUrls": {},
     }
@@ -366,9 +366,9 @@ async def r1_handler(websocket):
             log("→ Sent: presence (agent=online)")
 
             async def tick_loop():
-                """Send heartbeat ticks every 15s (as promised in hello-ok policy)."""
+                """Send heartbeat ticks every 8s (faster than R1's ~12s timeout)."""
                 while True:
-                    await asyncio.sleep(15)
+                    await asyncio.sleep(8)
                     try:
                         await websocket.send(json.dumps({
                             "type": "event",
@@ -573,7 +573,9 @@ async def main():
     health_server = await asyncio.start_server(health_endpoint, "0.0.0.0", health_port)
     print(f"  ✓ Health check: http://0.0.0.0:{health_port}")
 
-    async with serve(r1_handler, BRIDGE_HOST, BRIDGE_PORT):
+    async with serve(r1_handler, BRIDGE_HOST, BRIDGE_PORT,
+                      ping_interval=10, ping_timeout=5,
+                      close_timeout=5):
         print(f"  ✓ Bridge listening on ws://{BRIDGE_HOST}:{BRIDGE_PORT}")
         print()
         print("  Waiting for Rabbit R1 connections...")
