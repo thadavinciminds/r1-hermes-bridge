@@ -418,6 +418,10 @@ async def r1_handler(websocket):
             log(f"  ← {msg_type}/{method or msg.get('event', '?')} id={msg_id}" +
                 (f" text={params.get('text', '')[:80]}" if method == "chat.send" else ""))
 
+            # DUMP full message for chat.send to find where text actually is
+            if method == "chat.send":
+                log(f"  ← FULL MSG: {json.dumps(msg, default=str)[:500]}")
+
             if msg_type == "req":
                 if method == "chat.send":
                     log(f"  ← DISPATCHING handler for {msg_id}")
