@@ -218,10 +218,8 @@ async def handle_connect(ws, request_id: str, params: dict) -> dict:
                 "talk.session.close",
             ],
             "events": [
-                "agent.message",
-                "agent.thinking",
-                "agent.error",
-                "chat.message",
+                "agent",
+                "chat",
                 "presence",
                 "tick",
                 "heartbeat",
@@ -415,15 +413,11 @@ async def handle_chat_send_stream(ws, request_id: str, params: dict, device_id: 
             "event": "chat",
             "seq": next_seq_fn(),
             "payload": {
+                "id": run_id,
                 "runId": run_id,
-                "sessionKey": session_key,
-                "seq": 1,
                 "state": "final",
-                "message": {
-                    "role": "assistant",
-                    "content": [{"type": "text", "text": reply}],
-                    "timestamp": end_ts,
-                },
+                "sessionKey": session_key,
+                "endedAt": end_ts,
             },
         }))
         print("  → Sent: ACK + agent.thinking(start) + agent.assistant + thinking(end) + lifecycle(end) + chat.final")
@@ -436,11 +430,12 @@ async def handle_chat_send_stream(ws, request_id: str, params: dict, device_id: 
             "event": "chat",
             "seq": next_seq_fn(),
             "payload": {
+                "id": run_id,
                 "runId": run_id,
-                "sessionKey": session_key,
-                "seq": 1,
                 "state": "error",
-                "errorMessage": str(e),
+                "sessionKey": session_key,
+                "endedAt": now_ts,
+                "error": str(e),
             },
         }))
 

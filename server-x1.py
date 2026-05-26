@@ -386,15 +386,11 @@ async def _handle_chat_send_stream(ws, request_id: str, params: dict, device_id:
             "event": "chat",
             "seq": next_seq_fn(),
             "payload": {
+                "id": run_id,
                 "runId": run_id,
-                "sessionKey": session_key,
-                "seq": 5,
                 "state": "final",
-                "message": {
-                    "role": "assistant",
-                    "content": [{"type": "text", "text": reply}],
-                    "timestamp": end_ts,
-                },
+                "sessionKey": session_key,
+                "endedAt": end_ts,
             },
         }))
         log("  → Sent: chat.final")
@@ -449,11 +445,12 @@ async def _handle_chat_send_stream(ws, request_id: str, params: dict, device_id:
             "event": "chat",
             "seq": next_seq_fn(),
             "payload": {
+                "id": run_id,
                 "runId": run_id,
-                "sessionKey": session_key,
-                "seq": 5,
                 "state": "error",
-                "errorMessage": str(e),
+                "sessionKey": session_key,
+                "endedAt": now_ts,
+                "error": str(e),
             },
         }))
         log("  → Sent: chat.final (error)")
