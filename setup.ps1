@@ -1,5 +1,5 @@
-# R1 ↔ Hermes Bridge — x1 Windows Setup
-# ========================================
+# R1 -> Hermes Bridge -- x1 Windows Setup
+# =========================================
 # Run this on your x1 laptop. It will:
 #   1. Install Python dependencies (websockets, httpx, qrcode)
 #   2. Detect your WiFi IP address
@@ -11,243 +11,169 @@
 #   .\setup.ps1
 
 param(
-    [switch]$NoStart,       # Generate QR only, don't start bridge
+    [switch]$NoStart,
     [switch]$Help
 )
 
 if ($Help) {
-    Write-Host @"
-R1 ↔ Hermes Bridge — x1 Setup
-==============================
-Run this on your x1 laptop to create a bridge that connects your R1 to Hermes.
-
-Options:
-  -NoStart    Generate QR code only, don't start the bridge
-  -Help       Show this help
-
-The bridge:
-  - Accepts WebSocket connections from your R1 on port 18790
-  - Forwards all chat to Hermes at 100.116.144.9:8642 via Tailscale
-  - Streams responses back to your R1 in real-time
-"@
+    Write-Host ""
+    Write-Host "R1 -> Hermes Bridge -- x1 Setup"
+    Write-Host "================================"
+    Write-Host "Connects your Rabbit R1 to Hermes Agent via this laptop."
+    Write-Host ""
+    Write-Host "Options:"
+    Write-Host "  -NoStart    Generate QR code only, don't start the bridge"
+    Write-Host "  -Help       Show this help"
+    Write-Host ""
     exit 0
 }
 
 $ErrorActionPreference = "Stop"
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $BridgePort = 18790
-$HealthPort = $BridgePort - 2  # 18788
+$HealthPort = 18788
 
-# ── Colors ──────────────────────────────────────────────────────────────────
-function Write-Banner {
-    Write-Host ""
-    Write-Host "  ╔══════════════════════════════════════════╗" -ForegroundColor Cyan
-    Write-Host "  ║     🐇  R1 → Hermes Bridge (x1 Setup)    ║" -ForegroundColor Cyan
-    Write-Host "  ╚══════════════════════════════════════════╝" -ForegroundColor Cyan
-    Write-Host ""
-}
+Write-Host ""
+Write-Host "=== R1 -> Hermes Bridge (x1 Setup) ===" -ForegroundColor Cyan
+Write-Host ""
 
-# ── Python Check ────────────────────────────────────────────────────────────
-function Test-PythonInstalled {
-    try {
-        $v = python --version 2>&1
-        Write-Host "  ✓ Python: $v" -ForegroundColor Green
-        return $true
-    } catch {
-        Write-Host "  ✗ Python not found! Install from https://python.org" -ForegroundColor Red
-        Write-Host "    Make sure to check 'Add Python to PATH' during install."
-        return $false
-    }
-}
-
-# ── Dependencies ────────────────────────────────────────────────────────────
-function Install-Dependencies {
-    Write-Host "  Checking dependencies..." -ForegroundColor Yellow
-    
-    $packages = @("websockets", "httpx", "qrcode[pil]")
-    $missing = @()
-    
-    foreach ($pkg in $packages) {
-        $name = $pkg -replace '\[.*\]', ''
-        $result = python -c "import $name; print('ok')" 2>&1
-        if ($result -ne "ok") {
-            $missing += $pkg
-        }
-    }
-    
-    if ($missing.Count -gt 0) {
-        Write-Host "  Installing: $($missing -join ', ')..." -ForegroundColor Yellow
-        foreach ($pkg in $missing) {
-            python -m pip install $pkg --quiet
-            Write-Host "    ✓ $pkg" -ForegroundColor Green
-        }
-    } else {
-        Write-Host "  ✓ All dependencies found" -ForegroundColor Green
-    }
-}
-
-# ── Auth Token ──────────────────────────────────────────────────────────────
-function Get-AuthToken {
-    $TokenFile = Join-Path $ScriptDir ".r1-auth-token"
-    
-    if (Test-Path $TokenFile) {
-        $token = Get-Content $TokenFile -Raw
-        $token = $token.Trim()
-        if ($token.Length -gt 0) {
-            return $token
-        }
-    }
-    
-    # Generate new token
-    $bytes = New-Object byte[] 32
-    [System.Security.Cryptography.RandomNumberGenerator]::Fill($bytes)
-    $token = -join ($bytes | ForEach-Object { $_.ToString("x2") })
-    
-    Set-Content -Path $TokenFile -Value $token -NoNewline
-    return $token
-}
-
-# ── WiFi IP Detection ───────────────────────────────────────────────────────
-function Get-WiFiIP {
-    try {
-        # Get the IP of the interface that has a default route to 192.168.x.x
-        $ips = Get-NetIPAddress -AddressFamily IPv4 | Where-Object {
-            $_.IPAddress -like "192.168.*" -or $_.IPAddress -like "10.*" -or $_.IPAddress -like "172.16.*"
-        } | Sort-Object -Property InterfaceMetric
-        
-        if ($ips.Count -eq 0) {
-            # Fallback: any non-loopback, non-APIPA
-            $ips = Get-NetIPAddress -AddressFamily IPv4 | Where-Object {
-                $_.IPAddress -notlike "127.*" -and $_.IPAddress -notlike "169.254.*"
-            } | Sort-Object -Property InterfaceMetric
-        }
-        
-        # Prefer WiFi interfaces
-        $wifi = $ips | Where-Object { $_.InterfaceAlias -match "wi-?fi|wlan|wireless" }
-        if ($wifi) { $ips = $wifi }
-        
-        return ($ips | Select-Object -First 1).IPAddress
-    } catch {
-        Write-Host "  ⚠ Could not auto-detect IP. Using fallback..." -ForegroundColor Yellow
-        return "192.168.1.100"  # User will need to override
-    }
-}
-
-# ── QR Code Generation ──────────────────────────────────────────────────────
-function New-QRCode {
-    param([string]$Token, [string]$IP)
-    
-    $payload = @{
-        type     = "clawdbot-gateway"
-        version  = 1
-        ips      = @($IP)
-        port     = $BridgePort
-        token    = $Token
-        protocol = "ws"
-    } | ConvertTo-Json -Compress
-    
-    Write-Host ""
-    Write-Host "  QR Payload:" -ForegroundColor Yellow
-    Write-Host "  $payload" -ForegroundColor DarkGray
-    Write-Host ""
-    
-    $qrPath = Join-Path $ScriptDir "r1-hermes-qr.png"
-    $payloadFile = Join-Path $ScriptDir ".qr-payload.json"
-    
-    # Write payload to temp file so special chars don't break shell arg passing
-    Set-Content -Path $payloadFile -Value $payload -NoNewline
-    
-    # Generate QR using standalone Python script (avoids quote-escaping hell)
-    $qrgen = Join-Path $ScriptDir "qrgen.py"
-    python $qrgen $qrPath $payloadFile
-    
-    # Clean up temp file
-    Remove-Item $payloadFile -ErrorAction SilentlyContinue
-
-    Write-Host "  ✓ QR code saved: $qrPath" -ForegroundColor Green
-    Write-Host ""
-    
-    # Open the image
-    Start-Process $qrPath
-}
-
-# ── Firewall Rule ───────────────────────────────────────────────────────────
-function Add-FirewallRule {
-    Write-Host "  Checking firewall..." -ForegroundColor Yellow
-    
-    $ruleName = "R1 Hermes Bridge (Port $BridgePort)"
-    $existing = Get-NetFirewallRule -DisplayName $ruleName -ErrorAction SilentlyContinue
-    
-    if (-not $existing) {
-        try {
-            New-NetFirewallRule -DisplayName $ruleName `
-                -Direction Inbound -Protocol TCP -LocalPort $BridgePort,$HealthPort `
-                -Action Allow -Profile Private,Public | Out-Null
-            Write-Host "  ✓ Firewall rule added for ports $BridgePort,$HealthPort" -ForegroundColor Green
-        } catch {
-            Write-Host "  ⚠ Could not add firewall rule (run as Admin?). You may need to allow port $BridgePort manually." -ForegroundColor Yellow
-        }
-    } else {
-        Write-Host "  ✓ Firewall rule already exists" -ForegroundColor Green
-    }
-}
-
-# ── Main ────────────────────────────────────────────────────────────────────
-
-Write-Banner
-
-# Check Python
-if (-not (Test-PythonInstalled)) {
-    Write-Host ""
-    Write-Host "  Install Python from https://python.org then re-run this script."
+# ---- Check Python ----
+try {
+    $pyVer = python --version 2>&1
+    Write-Host "[OK] Python: $pyVer" -ForegroundColor Green
+} catch {
+    Write-Host "[FAIL] Python not found! Install from https://python.org" -ForegroundColor Red
+    Write-Host "       Make sure to check 'Add Python to PATH' during install."
     pause
     exit 1
 }
 
-# Install deps
-Install-Dependencies
+# ---- Install Dependencies ----
+Write-Host "[..] Checking Python dependencies..." -ForegroundColor Yellow
+$deps = @("websockets", "httpx", "qrcode")
+$missing = @()
+foreach ($dep in $deps) {
+    $result = python -c "import $dep; print('ok')" 2>&1
+    if ($result -ne "ok") {
+        $missing += $dep
+    }
+}
+if ($missing.Count -gt 0) {
+    Write-Host "[..] Installing: $($missing -join ', ')..." -ForegroundColor Yellow
+    foreach ($dep in $missing) {
+        python -m pip install $dep --quiet
+        Write-Host "     [OK] $dep" -ForegroundColor Green
+    }
+} else {
+    Write-Host "[OK] All dependencies found" -ForegroundColor Green
+}
 Write-Host ""
 
-# Get auth token
-$Token = Get-AuthToken
-Write-Host "  Auth token: $($Token.Substring(0,16))..." -ForegroundColor Blue
+# ---- Auth Token ----
+$tokenFile = Join-Path $ScriptDir ".r1-auth-token"
+if (Test-Path $tokenFile) {
+    $token = (Get-Content $tokenFile -Raw).Trim()
+}
+if (-not $token -or $token.Length -eq 0) {
+    $bytes = New-Object byte[] 32
+    [System.Security.Cryptography.RandomNumberGenerator]::Fill($bytes)
+    $token = -join ($bytes | ForEach-Object { $_.ToString("x2") })
+    Set-Content -Path $tokenFile -Value $token -NoNewline
+}
+Write-Host "[OK] Auth token: $($token.Substring(0, [Math]::Min(16, $token.Length)))..." -ForegroundColor Blue
 Write-Host ""
 
-# Detect WiFi IP
-$WiFiIP = Get-WiFiIP
-Write-Host "  WiFi IP: $WiFiIP" -ForegroundColor Green
-Write-Host "  (If this is wrong, edit the QR or re-run with correct network)"
+# ---- Detect WiFi IP ----
+$wifiIP = $null
+try {
+    $allIPs = Get-NetIPAddress -AddressFamily IPv4 | Where-Object {
+        $_.IPAddress -like "192.168.*" -or
+        $_.IPAddress -like "10.*" -or
+        $_.IPAddress -like "172.16.*"
+    } | Sort-Object -Property InterfaceMetric
 
-# Setup firewall
-Add-FirewallRule
+    if ($allIPs.Count -gt 0) {
+        $wifi = $allIPs | Where-Object { $_.InterfaceAlias -match "wi-?fi|wlan|wireless" }
+        if ($wifi) { $allIPs = $wifi }
+        $wifiIP = ($allIPs | Select-Object -First 1).IPAddress
+    }
+} catch {}
+
+if (-not $wifiIP) {
+    $wifiIP = "192.168.1.100"
+    Write-Host "[WARN] Could not detect WiFi IP. Using $wifiIP" -ForegroundColor Yellow
+} else {
+    Write-Host "[OK] WiFi IP: $wifiIP" -ForegroundColor Green
+}
 Write-Host ""
 
-# Generate QR
-New-QRCode -Token $Token -IP $WiFiIP
-
-# Connection info
-Write-Host "  ══════════════════════════════════════════" -ForegroundColor Green
-Write-Host "  Connection Info" -ForegroundColor Green
-Write-Host "  ══════════════════════════════════════════" -ForegroundColor Green
+# ---- Firewall Rule ----
+Write-Host "[..] Checking firewall..." -ForegroundColor Yellow
+$ruleName = "R1 Hermes Bridge (Port $BridgePort)"
+$existing = Get-NetFirewallRule -DisplayName $ruleName -ErrorAction SilentlyContinue
+if (-not $existing) {
+    try {
+        New-NetFirewallRule -DisplayName $ruleName -Direction Inbound -Protocol TCP -LocalPort $BridgePort,$HealthPort -Action Allow -Profile Private,Public | Out-Null
+        Write-Host "[OK] Firewall rule added for ports $BridgePort,$HealthPort" -ForegroundColor Green
+    } catch {
+        Write-Host "[WARN] Could not add firewall rule (run as Admin?). You may need to allow port $BridgePort manually." -ForegroundColor Yellow
+    }
+} else {
+    Write-Host "[OK] Firewall rule already exists" -ForegroundColor Green
+}
 Write-Host ""
-Write-Host "  Bridge:    ws://${WiFiIP}:${BridgePort}" -ForegroundColor Cyan
-Write-Host "  Health:    http://${WiFiIP}:${HealthPort}" -ForegroundColor Cyan
+
+# ---- Generate QR Code ----
+$payload = @{
+    type     = "clawdbot-gateway"
+    version  = 1
+    ips      = @($wifiIP)
+    port     = $BridgePort
+    token    = $token
+    protocol = "ws"
+} | ConvertTo-Json -Compress
+
+Write-Host "[..] QR payload: $payload" -ForegroundColor DarkGray
+Write-Host ""
+
+$qrPath = Join-Path $ScriptDir "r1-hermes-qr.png"
+$payloadFile = Join-Path $ScriptDir ".qr-payload.json"
+Set-Content -Path $payloadFile -Value $payload -NoNewline
+
+$qrgen = Join-Path $ScriptDir "qrgen.py"
+python $qrgen $qrPath $payloadFile
+
+Remove-Item $payloadFile -ErrorAction SilentlyContinue
+
+Write-Host "[OK] QR code saved: $qrPath" -ForegroundColor Green
+Write-Host ""
+
+# Open the image
+Start-Process $qrPath
+
+# ---- Connection Info ----
+Write-Host "=====================================" -ForegroundColor Green
+Write-Host " CONNECTION INFO" -ForegroundColor Green
+Write-Host "=====================================" -ForegroundColor Green
+Write-Host ""
+Write-Host "  Bridge:    ws://${wifiIP}:${BridgePort}" -ForegroundColor Cyan
+Write-Host "  Health:    http://${wifiIP}:${HealthPort}" -ForegroundColor Cyan
 Write-Host "  Hermes:    http://100.116.144.9:8642/v1 (via Tailscale)" -ForegroundColor DarkGray
 Write-Host ""
 
+# ---- Start Bridge ----
 if (-not $NoStart) {
-    Write-Host "  Starting bridge server..." -ForegroundColor Green
-    Write-Host "  (Press Ctrl+C to stop)" -ForegroundColor DarkGray
+    Write-Host "[..] Starting bridge server..." -ForegroundColor Green
+    Write-Host "     (Press Ctrl+C to stop)" -ForegroundColor DarkGray
     Write-Host ""
-    
-    # Start the bridge
+
     $env:HERMES_API_URL = "http://100.116.144.9:8642/v1"
-    $env:R1_AUTH_TOKEN = $Token
+    $env:R1_AUTH_TOKEN = $token
     $env:R1_BRIDGE_PORT = $BridgePort
-    
+
     python (Join-Path $ScriptDir "server-x1.py")
 } else {
-    Write-Host "  To start the bridge:" -ForegroundColor Yellow
-    Write-Host "    python server-x1.py" -ForegroundColor Cyan
+    Write-Host "To start the bridge:" -ForegroundColor Yellow
+    Write-Host "  python server-x1.py" -ForegroundColor Cyan
     Write-Host ""
 }
