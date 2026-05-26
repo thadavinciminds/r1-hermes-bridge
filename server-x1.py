@@ -462,6 +462,58 @@ async def r1_handler(websocket):
                         "payload": {"configured": False},
                     }))
 
+                elif method == "talk.session.create":
+                    # R1 wants to start a voice session — issue a session ID
+                    session_id = f"ts_{secrets.token_hex(8)}"
+                    await websocket.send(json.dumps({
+                        "type": "res", "id": msg_id, "ok": True,
+                        "payload": {
+                            "sessionId": session_id,
+                            "status": "created",
+                        },
+                    }))
+                    log(f"  🎤 Talk session created: {session_id[:16]}...")
+
+                elif method == "talk.session.startTurn":
+                    turn_id = params.get("turnId", f"turn_{secrets.token_hex(8)}")
+                    await websocket.send(json.dumps({
+                        "type": "res", "id": msg_id, "ok": True,
+                        "payload": {
+                            "turnId": turn_id,
+                            "status": "listening",
+                            "timeoutMs": 10000,
+                        },
+                    }))
+                    log(f"  🎤 Turn started: {turn_id[:20]}...")
+
+                elif method == "talk.session.appendAudio":
+                    # Audio chunk received — stash for now (we'll need a transcriber)
+                    await websocket.send(json.dumps({
+                        "type": "res", "id": msg_id, "ok": True,
+                        "payload": {"received": True},
+                    }))
+
+                elif method == "talk.session.endTurn":
+                    # R1 finished speaking — acknowledge
+                    await websocket.send(json.dumps({
+                        "type": "res", "id": msg_id, "ok": True,
+                        "payload": {"status": "processing"},
+                    }))
+                    log(f"  🎤 Turn ended — awaiting transcript")
+
+                elif method == "talk.session.cancelTurn":
+                    await websocket.send(json.dumps({
+                        "type": "res", "id": msg_id, "ok": True,
+                        "payload": {"status": "cancelled"},
+                    }))
+
+                elif method == "talk.session.close":
+                    await websocket.send(json.dumps({
+                        "type": "res", "id": msg_id, "ok": True,
+                        "payload": {"status": "closed"},
+                    }))
+                    log(f"  🎤 Talk session closed")
+
                 else:
                     await websocket.send(json.dumps({
                         "type": "res", "id": msg_id, "ok": True,
