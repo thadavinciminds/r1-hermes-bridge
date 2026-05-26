@@ -363,6 +363,7 @@ async def r1_handler(websocket):
                 "event": "presence",
                 "payload": {"agent": "online", "ts": int(time.time() * 1000)},
             }))
+            log("→ Sent: presence (agent=online)")
 
             async def tick_loop():
                 """Send heartbeat ticks every 15s (as promised in hello-ok policy)."""
@@ -374,12 +375,13 @@ async def r1_handler(websocket):
                             "event": "tick",
                             "payload": {"ts": int(time.time() * 1000)},
                         }))
+                        log("→ Sent: tick (heartbeat)")
                     except websockets.exceptions.ConnectionClosed:
                         break
 
             tick_task = asyncio.create_task(tick_loop())
-        except Exception:
-            pass  # Non-fatal — tick is best-effort
+        except Exception as e:
+            log(f"⚠ Tick setup failed: {e}")
 
         # Step 4: Message loop
         async for raw in websocket:
