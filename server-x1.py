@@ -284,6 +284,7 @@ async def r1_handler(websocket):
     """Handle a single R1 WebSocket connection."""
     peer = websocket.remote_address
     device_id = None
+    tick_task = None
     log(f"🔌 New connection from {peer}")
 
     try:
@@ -322,6 +323,32 @@ async def r1_handler(websocket):
 
         device_info = connect_params.get("device", {})
         device_id = device_info.get("id", f"r1-{secrets.token_hex(8)}")
+
+        # ── Step 3.5: Announce agent presence + start tick heartbeat ────────
+        tick_task = None
+        try:
+            await websocket.send(json.dumps({
+                "type": "event",
+                "event": "presence",
+                "payload": {"agent": "online", "ts": int(time.time() * 1000)},
+            }))
+
+            async def tick_loop():
+                """Send heartbeat ticks every 15s (as promised in hello-ok policy)."""
+                while True:
+                    await asyncio.sleep(15)
+                    try:
+                        await websocket.send(json.dumps({
+                            "type": "event",
+                            "event": "tick",
+                            "payload": {"ts": int(time.time() * 1000)},
+                        }))
+                    except websockets.exceptions.ConnectionClosed:
+                        break
+
+            tick_task = asyncio.create_task(tick_loop())
+        except Exception:
+            pass  # Non-fatal — tick is best-effort
 
         # Step 4: Message loop
         async for raw in websocket:
@@ -418,6 +445,8 @@ async def r1_handler(websocket):
     except Exception as e:
         log(f"❌ Error handling {peer}: {e}")
     finally:
+        if tick_task is not None:
+            tick_task.cancel()
         if device_id and device_id in devices:
             del devices[device_id]
             log(f"🧹 Cleaned up: {device_id[:12]}...")
