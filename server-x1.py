@@ -396,6 +396,8 @@ async def r1_handler(websocket):
             method = msg.get("method", "")
             params = msg.get("params", {})
 
+            log(f"  ← {msg_type}/{method or msg.get('event', '?')} id={msg_id}")
+
             if msg_type == "req":
                 if method == "chat.send":
                     await handle_chat_send_stream(websocket, msg_id, params, device_id)
