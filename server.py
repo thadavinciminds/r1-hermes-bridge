@@ -37,7 +37,17 @@ HERMES_API_KEY = os.getenv(
     "HERMES_API_KEY",
     os.getenv("API_SERVER_KEY", "hermes-Fk25u-U_v5DXSpF7N24EDTF4HkJJDPlW"),
 )
-AUTH_TOKEN = os.getenv("R1_AUTH_TOKEN", secrets.token_hex(32))
+# Auth token: env var first, then file, then generate + persist
+_AUTH_TOKEN_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".r1-auth-token")
+AUTH_TOKEN = os.getenv("R1_AUTH_TOKEN")
+if not AUTH_TOKEN:
+    try:
+        with open(_AUTH_TOKEN_FILE) as f:
+            AUTH_TOKEN = f.read().strip()
+    except FileNotFoundError:
+        AUTH_TOKEN = secrets.token_hex(32)
+        with open(_AUTH_TOKEN_FILE, "w") as f:
+            f.write(AUTH_TOKEN)
 
 # ── State ───────────────────────────────────────────────────────────────────
 
@@ -45,6 +55,33 @@ AUTH_TOKEN = os.getenv("R1_AUTH_TOKEN", secrets.token_hex(32))
 devices: dict = {}
 # Track pending pairing requests: {request_id: device_id}
 pending_requests: dict = {}
+
+# ── Device Token Persistence ────────────────────────────────────────────────
+
+DEVICE_TOKENS_FILE = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), ".r1-device-tokens.json"
+)
+
+
+def load_device_tokens() -> set:
+    """Load persisted device tokens from disk."""
+    if not os.path.exists(DEVICE_TOKENS_FILE):
+        return set()
+    try:
+        with open(DEVICE_TOKENS_FILE) as f:
+            data = json.load(f)
+        return set(data.get("tokens", []))
+    except (json.JSONDecodeError, IOError):
+        return set()
+
+
+def save_device_token(token: str):
+    """Persist a device token to disk."""
+    tokens = load_device_tokens()
+    tokens.add(token)
+    os.makedirs(os.path.dirname(DEVICE_TOKENS_FILE), exist_ok=True)
+    with open(DEVICE_TOKENS_FILE, "w") as f:
+        json.dump({"tokens": list(tokens)}, f)
 
 # ── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -153,15 +190,27 @@ async def handle_connect(ws, request_id: str, params: dict) -> dict:
     auth = params.get("auth", {})
     role = params.get("role", "node")
 
-    # Verify auth token
+    # Verify auth token — accept pairing token, persisted device tokens, or in-memory tokens
     token = auth.get("token", "")
-    if token != AUTH_TOKEN:
-        return {
-            "type": "res",
-            "id": request_id,
-            "ok": False,
-            "error": {"code": "UNAUTHORIZED", "message": "Invalid auth token"},
-        }
+    valid_tokens = {AUTH_TOKEN}
+    valid_tokens.update(load_device_tokens())  # persisted
+    for d in devices.values():                 # in-memory (belt-and-suspenders)
+        dt = d.get("device_token")
+        if dt:
+            valid_tokens.add(dt)
+
+    if token not in valid_tokens:
+        # Bootstrap: if no tokens ever persisted and no devices active, accept any token
+        if len(devices) == 0 and len(load_device_tokens()) == 0:
+            print(f"  🔓 Bootstrap: accepting unseen device token (first-ever connection)")
+            save_device_token(token)
+        else:
+            return {
+                "type": "res",
+                "id": request_id,
+                "ok": False,
+                "error": {"code": "UNAUTHORIZED", "message": "Invalid auth token"},
+            }
 
     device_id = device_info.get("id", f"r1-{secrets.token_hex(8)}")
     display_name = f"Rabbit R1 ({client_info.get('platform', 'unknown')})"
@@ -177,6 +226,7 @@ async def handle_connect(ws, request_id: str, params: dict) -> dict:
 
     # Generate device token
     device_token = generate_device_token()
+    save_device_token(device_token)  # persist for reconnects
 
     devices[device_id] = {
         "ws": ws,
@@ -323,39 +373,43 @@ async def handle_chat_send_stream(ws, request_id: str, params: dict, device_id: 
     text = params.get("message") or params.get("text", "")
     messages = params.get("messages", None)
     session_key = params.get("sessionKey", "main")
-
     if not text and not messages:
-        await ws.send(json.dumps({
-            "type": "res", "id": request_id, "ok": False,
-            "error": {"code": "INVALID_PARAMS", "message": "text or messages required"},
-        }))
-        return
+        try:
+            await ws.send(json.dumps({
+                "type": "res", "id": request_id, "ok": False,
+                "error": {"code": "INVALID_PARAMS", "message": "text or messages required"},
+            }))
+        except (websockets.exceptions.ConnectionClosed, asyncio.CancelledError):
+            pass
+        return None
 
     print(f"  📩 Chat from {device_id[:12]}...: {text[:120]}")
 
-    # ── ACK with runId + status: "started" ───────────────────────────────
-    run_id = f"run_{secrets.token_hex(8)}"
+    run_id = params.get("idempotencyKey") or f"run_{secrets.token_hex(8)}"
     started_at = int(time.time() * 1000)
-    await ws.send(json.dumps({
-        "type": "res", "id": request_id, "ok": True,
-        "payload": {"runId": run_id, "status": "started"},
-    }))
-
-    # ── agent.thinking (active=true) ─────────────────────────────────────
-    await ws.send(json.dumps({
-        "type": "event",
-        "event": "agent",
-        "seq": next_seq_fn(),
-        "payload": {
-            "runId": run_id, "seq": 1,
-            "stream": "thinking",
-            "ts": started_at,
-            "data": {"text": "", "delta": "", "active": True},
-            "sessionKey": session_key,
-        },
-    }))
 
     try:
+        # ── ACK with runId + status: "started" ───────────────────────────
+        await ws.send(json.dumps({
+            "type": "res", "id": request_id, "ok": True,
+            "payload": {"runId": run_id, "status": "started", "sessionKey": session_key},
+        }))
+
+        # ── agent.thinking (active=true) ─────────────────────────────────
+        await ws.send(json.dumps({
+            "type": "event",
+            "event": "agent",
+            "seq": next_seq_fn(),
+            "payload": {
+                "runId": run_id, "seq": 1,
+                "stream": "thinking",
+                "ts": started_at,
+                "data": {"text": "", "delta": "", "active": True},
+                "sessionKey": session_key,
+            },
+        }))
+
+        # ── Call Hermes API ──────────────────────────────────────────────
         if messages:
             reply = await hermes_chat(messages)
         else:
@@ -407,37 +461,67 @@ async def handle_chat_send_stream(ws, request_id: str, params: dict, device_id: 
             },
         }))
 
-        # ── chat.final event ─────────────────────────────────────────
+        # ── chat.final event (matches OpenClaw protocol — this is the
+        #    event that tells the R1 the turn is complete and input is
+        #    unlocked; no separate "idle" event exists in the protocol).
+        chat_final_seq = next_seq_fn()
         await ws.send(json.dumps({
             "type": "event",
             "event": "chat",
-            "seq": next_seq_fn(),
+            "seq": chat_final_seq,
             "payload": {
-                "id": run_id,
                 "runId": run_id,
+                "sessionKey": session_key,
+                "seq": chat_final_seq,
                 "state": "final",
-                "sessionKey": session_key,
-                "endedAt": end_ts,
+                "message": {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": reply}],
+                    "timestamp": end_ts,
+                },
             },
         }))
-        print("  → Sent: ACK + agent.thinking(start) + agent.assistant + thinking(end) + lifecycle(end) + chat.final")
 
-    except Exception as e:
-        print(f"  ❌ Hermes error: {e}")
-        now_ts = int(time.time() * 1000)
+        # Send a presence event to signal the agent is now idle — the R1
+        # may be waiting for this before unlocking the input for the next message
         await ws.send(json.dumps({
             "type": "event",
-            "event": "chat",
+            "event": "presence",
             "seq": next_seq_fn(),
             "payload": {
-                "id": run_id,
-                "runId": run_id,
-                "state": "error",
-                "sessionKey": session_key,
-                "endedAt": now_ts,
-                "error": str(e),
+                "status": "idle",
+                "deviceId": device_id,
+                "ts": end_ts,
             },
         }))
+
+        print("  → Sent: ACK + thinking(start) + assistant + thinking(end) + lifecycle(end) + chat.final + presence(idle)")
+        return run_id
+
+    except websockets.exceptions.ConnectionClosed:
+        print(f"  🔌 R1 disconnected mid-response for {device_id[:12]}")
+    except asyncio.CancelledError:
+        print(f"  ⚡ Chat handler cancelled for {device_id[:12]}")
+    except Exception as e:
+        print(f"  ❌ Chat error for {device_id[:12]}: {type(e).__name__}: {e}")
+        # Try to send error event, but don't crash if R1 is already gone
+        try:
+            now_ts = int(time.time() * 1000)
+            err_seq = next_seq_fn()
+            await ws.send(json.dumps({
+                "type": "event",
+                "event": "chat",
+                "seq": err_seq,
+                "payload": {
+                    "runId": run_id,
+                    "sessionKey": session_key,
+                    "seq": err_seq,
+                    "state": "error",
+                    "errorMessage": str(e),
+                },
+            }))
+        except Exception:
+            pass
 
 
 # ── WebSocket Connection Handler ────────────────────────────────────────────
@@ -497,125 +581,168 @@ async def r1_handler(websocket):
             _seq_counter[0] += 1
             return _seq_counter[0]
 
-        # Step 4: Message loop — handle subsequent messages
-        async for raw in websocket:
+        # Send presence event to wake up the R1 mascot
+        now_ms = int(time.time() * 1000)
+        await websocket.send(json.dumps({
+            "type": "event",
+            "event": "presence",
+            "seq": next_seq(),
+            "payload": {
+                "deviceId": device_id,
+                "status": "online",
+                "ts": now_ms,
+            },
+        }))
+        print(f"  → Sent presence event")
+
+        # Start tick heartbeat (every 8 seconds — R1 timeout is ~8s despite hello-ok saying 15s)
+        async def tick_loop():
             try:
-                msg = json.loads(raw)
-            except json.JSONDecodeError:
-                print(f"  ⚠ Invalid JSON from {device_id[:12]}")
-                continue
-
-            msg_type = msg.get("type", "")
-            msg_id = msg.get("id", generate_request_id())
-            method = msg.get("method", "")
-            params = msg.get("params", {})
-
-            if msg_type == "req":
-                print(f"  ← RPC: {method} id={msg_id}")
-
-                if method == "chat.send":
-                    await handle_chat_send_stream(websocket, msg_id, params, device_id, next_seq)
-
-                elif method == "chat.history":
+                while True:
+                    await asyncio.sleep(8)
                     await websocket.send(json.dumps({
-                        "type": "res", "id": msg_id, "ok": True,
-                        "payload": {"messages": []},
+                        "type": "event",
+                        "event": "tick",
+                        "seq": next_seq(),
+                        "payload": {"ts": int(time.time() * 1000)},
                     }))
-
-                elif method == "health":
-                    await websocket.send(json.dumps({
-                        "type": "res", "id": msg_id, "ok": True,
-                        "payload": {"status": "ok", "uptime": int(time.time()), "version": "Hermes-Bridge/1.0"},
-                    }))
-
-                elif method == "status":
-                    await websocket.send(json.dumps({
-                        "type": "res", "id": msg_id, "ok": True,
-                        "payload": {
-                            "gateway": {"status": "running", "version": "Hermes-Bridge/1.0"},
-                            "devices": len(devices),
-                            "agent": "Hermes Agent",
-                        },
-                    }))
-
-                elif method == "system-presence":
-                    presence_entries = {}
-                    for did, d in devices.items():
-                        presence_entries[did] = {
-                            "deviceId": did,
-                            "displayName": d["display_name"],
-                            "roles": [d["role"]],
-                            "scopes": [],
-                            "connected": True,
-                        }
-                    await websocket.send(json.dumps({
-                        "type": "res", "id": msg_id, "ok": True,
-                        "payload": {"entries": presence_entries},
-                    }))
-
-                elif method == "node.list":
-                    node_list = []
-                    for did, d in devices.items():
-                        node_list.append({
-                            "deviceId": did,
-                            "displayName": d["display_name"],
-                            "role": d["role"],
-                            "approved": d["approved"],
-                            "connected": True,
-                            "lastSeenAtMs": int(time.time() * 1000),
-                            "lastSeenReason": "connect",
-                            "caps": d.get("client", {}).get("caps", []),
-                        })
-                    await websocket.send(json.dumps({
-                        "type": "res", "id": msg_id, "ok": True,
-                        "payload": {"nodes": node_list},
-                    }))
-
-                elif method == "node.pair.approve":
-                    req_id = params.get("requestId", "")
-                    if req_id in pending_requests:
-                        did = pending_requests[req_id]
-                        if did in devices:
-                            devices[did]["approved"] = True
-                            del pending_requests[req_id]
-                    await websocket.send(json.dumps({
-                        "type": "res", "id": msg_id, "ok": True,
-                        "payload": {"approved": True},
-                    }))
-
-                elif method == "node.event":
-                    # Handle node events (like presence.alive)
-                    event_name = msg.get("event", params.get("event", ""))
-                    await websocket.send(json.dumps({
-                        "type": "res", "id": msg_id, "ok": True,
-                        "event": event_name, "handled": True, "reason": "ack",
-                    }))
-
-                elif method == "talk.catalog":
-                    await websocket.send(json.dumps({
-                        "type": "res", "id": msg_id, "ok": True,
-                        "payload": {"providers": []},
-                    }))
-
-                elif method == "talk.config":
-                    await websocket.send(json.dumps({
-                        "type": "res", "id": msg_id, "ok": True,
-                        "payload": {"configured": False},
-                    }))
-
-                else:
-                    print(f"  ⚠ Unknown method: {method}")
-                    await websocket.send(json.dumps({
-                        "type": "res", "id": msg_id, "ok": True,
-                        "payload": {"note": f"Method '{method}' acknowledged"},
-                    }))
-
-            elif msg_type == "event":
-                # Handle events from R1 (e.g., typing indicators, status)
+            except (websockets.exceptions.ConnectionClosed, asyncio.CancelledError):
                 pass
 
-            else:
-                print(f"  ⚠ Unknown message type: {msg_type}")
+        tick_task = asyncio.create_task(tick_loop())
+        try:
+            # Step 4: Message loop — handle subsequent messages
+            async for raw in websocket:
+                try:
+                    msg = json.loads(raw)
+                    # Debug: log every incoming message
+                    msg_type = msg.get("type", "")
+                    msg_id = msg.get("id", generate_request_id())
+                    method = msg.get("method", "")
+                    params = msg.get("params", {})
+                    # Truncate long messages for log readability
+                    raw_preview = raw[:300] + "..." if len(raw) > 300 else raw
+                    print(f"  ← RAW [{len(raw)}B]: {raw_preview}")
+                except json.JSONDecodeError:
+                    print(f"  ⚠ Invalid JSON from {device_id[:12] if device_id else peer}")
+                    continue
+
+                if msg_type == "req":
+                    print(f"  ← RPC: {method} id={msg_id}")
+
+                    if method == "chat.send":
+                        run_id = await handle_chat_send_stream(websocket, msg_id, params, device_id, next_seq)
+                        if run_id:
+                            print(f"  ✓ Chat turn complete (runId={run_id})")
+
+                    elif method == "chat.history":
+                        await websocket.send(json.dumps({
+                            "type": "res", "id": msg_id, "ok": True,
+                            "payload": {"messages": []},
+                        }))
+
+                    elif method == "health":
+                        await websocket.send(json.dumps({
+                            "type": "res", "id": msg_id, "ok": True,
+                            "payload": {"status": "ok", "uptime": int(time.time()), "version": "Hermes-Bridge/1.0"},
+                        }))
+
+                    elif method == "status":
+                        await websocket.send(json.dumps({
+                            "type": "res", "id": msg_id, "ok": True,
+                            "payload": {
+                                "gateway": {"status": "running", "version": "Hermes-Bridge/1.0"},
+                                "devices": len(devices),
+                                "agent": "Hermes Agent",
+                            },
+                        }))
+
+                    elif method == "system-presence":
+                        presence_entries = {}
+                        for did, d in devices.items():
+                            presence_entries[did] = {
+                                "deviceId": did,
+                                "displayName": d["display_name"],
+                                "roles": [d["role"]],
+                                "scopes": [],
+                                "connected": True,
+                            }
+                        await websocket.send(json.dumps({
+                            "type": "res", "id": msg_id, "ok": True,
+                            "payload": {"entries": presence_entries},
+                        }))
+
+                    elif method == "node.list":
+                        node_list = []
+                        for did, d in devices.items():
+                            node_list.append({
+                                "deviceId": did,
+                                "displayName": d["display_name"],
+                                "role": d["role"],
+                                "approved": d["approved"],
+                                "connected": True,
+                                "lastSeenAtMs": int(time.time() * 1000),
+                                "lastSeenReason": "connect",
+                                "caps": d.get("client", {}).get("caps", []),
+                            })
+                        await websocket.send(json.dumps({
+                            "type": "res", "id": msg_id, "ok": True,
+                            "payload": {"nodes": node_list},
+                        }))
+
+                    elif method == "node.pair.approve":
+                        req_id = params.get("requestId", "")
+                        if req_id in pending_requests:
+                            did = pending_requests[req_id]
+                            if did in devices:
+                                devices[did]["approved"] = True
+                                del pending_requests[req_id]
+                        await websocket.send(json.dumps({
+                            "type": "res", "id": msg_id, "ok": True,
+                            "payload": {"approved": True},
+                        }))
+
+                    elif method == "node.event":
+                        # Handle node events (like presence.alive)
+                        event_name = msg.get("event", params.get("event", ""))
+                        await websocket.send(json.dumps({
+                            "type": "res", "id": msg_id, "ok": True,
+                            "event": event_name, "handled": True, "reason": "ack",
+                        }))
+
+                    elif method == "talk.catalog":
+                        await websocket.send(json.dumps({
+                            "type": "res", "id": msg_id, "ok": True,
+                            "payload": {"providers": []},
+                        }))
+
+                    elif method == "talk.config":
+                        await websocket.send(json.dumps({
+                            "type": "res", "id": msg_id, "ok": True,
+                            "payload": {"configured": False},
+                        }))
+
+                    else:
+                        print(f"  ⚠ Unknown method: {method}")
+                        await websocket.send(json.dumps({
+                            "type": "res", "id": msg_id, "ok": True,
+                            "payload": {"note": f"Method '{method}' acknowledged"},
+                        }))
+
+                elif msg_type == "event":
+                    # Handle events from R1 (e.g., typing indicators, status)
+                    event_name = msg.get("event", "?")
+                    print(f"  ← EVENT: {event_name} payload={json.dumps(msg.get('payload', {}))[:200]}")
+                    pass
+
+                else:
+                    print(f"  ⚠ Unknown message type: {msg_type}")
+        finally:
+            tick_task.cancel()
+            try:
+                await tick_task
+            except asyncio.CancelledError:
+                pass
 
     except asyncio.TimeoutError:
         print(f"  ⏱ Timeout waiting for connect from {peer}")
@@ -632,14 +759,45 @@ async def r1_handler(websocket):
 # ── Main ────────────────────────────────────────────────────────────────────
 
 async def health_endpoint(reader, writer):
-    """Minimal HTTP health check — test reachability from browser/curl."""
+    """HTTP health check + QR code serving."""
     try:
-        body = json.dumps({"status": "ok", "devices": len(devices), "bridge": "r1-hermes"}).encode()
-        writer.write(
-            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
-            b"Content-Length: " + str(len(body)).encode() + b"\r\n"
-            b"Access-Control-Allow-Origin: *\r\n\r\n" + body
-        )
+        # Read request line to check path
+        raw_request = b""
+        while b"\r\n\r\n" not in raw_request:
+            chunk = await asyncio.wait_for(reader.read(4096), timeout=5)
+            if not chunk:
+                break
+            raw_request += chunk
+            if len(raw_request) > 8192:
+                break
+
+        request_line = raw_request.split(b"\r\n")[0].decode("utf-8", errors="replace")
+        path = request_line.split(" ")[1] if " " in request_line else "/"
+
+        if path == "/qr-final.png" or path == "/qr":
+            qr_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "qr-final.png")
+            if os.path.exists(qr_path):
+                with open(qr_path, "rb") as f:
+                    qr_data = f.read()
+                writer.write(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: image/png\r\n"
+                    b"Content-Length: " + str(len(qr_data)).encode() + b"\r\n"
+                    b"Access-Control-Allow-Origin: *\r\n\r\n" + qr_data
+                )
+            else:
+                body = b'{"error":"QR not found"}'
+                writer.write(
+                    b"HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\n"
+                    b"Content-Length: " + str(len(body)).encode() + b"\r\n"
+                    b"Access-Control-Allow-Origin: *\r\n\r\n" + body
+                )
+        else:
+            body = json.dumps({"status": "ok", "devices": len(devices), "bridge": "r1-hermes"}).encode()
+            writer.write(
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                b"Content-Length: " + str(len(body)).encode() + b"\r\n"
+                b"Access-Control-Allow-Origin: *\r\n\r\n" + body
+            )
         await writer.drain()
     finally:
         writer.close()
@@ -665,7 +823,7 @@ async def main():
     health_server = await asyncio.start_server(health_endpoint, "0.0.0.0", health_port)
     print(f"  ✓ Health check: http://0.0.0.0:{health_port}")
 
-    async with serve(r1_handler, BRIDGE_HOST, BRIDGE_PORT):
+    async with serve(r1_handler, BRIDGE_HOST, BRIDGE_PORT, ping_interval=20, ping_timeout=10):
         print(f"  ✓ Bridge listening on ws://{BRIDGE_HOST}:{BRIDGE_PORT}")
         await asyncio.get_running_loop().create_future()  # Run forever
 

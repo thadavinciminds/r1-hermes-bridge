@@ -302,11 +302,11 @@ async def _handle_chat_send_stream(ws, request_id: str, params: dict, device_id:
 
     # CRITICAL: immediate ACK with runId + status: "started"
     # The R1 shows "waiting" until it receives this.
-    run_id = f"run_{secrets.token_hex(8)}"
+    run_id = params.get("idempotencyKey") or f"run_{secrets.token_hex(8)}"
     started_at = int(time.time() * 1000)
     await ws.send(json.dumps({
         "type": "res", "id": request_id, "ok": True,
-        "payload": {"runId": run_id, "status": "started"},
+        "payload": {"runId": run_id, "status": "started", "sessionKey": session_key},
     }))
     log(f"  → ACK {request_id} (runId={run_id})")
 
@@ -322,8 +322,8 @@ async def _handle_chat_send_stream(ws, request_id: str, params: dict, device_id:
             "ts": started_at,
             "data": {"text": "", "delta": "", "active": True},
             "sessionKey": session_key,
-        },
-    }))
+            },
+        }))
 
     try:
         if messages:
@@ -381,21 +381,36 @@ async def _handle_chat_send_stream(ws, request_id: str, params: dict, device_id:
         # The R1 client waits for a "chat" event with state="final" before
         # it allows the next chat.send. Without this, the R1 shows "waiting"
         # indefinitely and never sends a second message.
+        chat_final_seq = next_seq_fn()
         await ws.send(json.dumps({
             "type": "event",
             "event": "chat",
-            "seq": next_seq_fn(),
+            "seq": chat_final_seq,
             "payload": {
-                "id": run_id,
                 "runId": run_id,
-                "state": "final",
                 "sessionKey": session_key,
-                "endedAt": end_ts,
+                "seq": chat_final_seq,
+                "state": "final",
+                "message": {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": reply}],
+                    "timestamp": end_ts,
+                },
             },
         }))
         log("  → Sent: chat.final")
 
-        log("  → Sent: thinking=end + lifecycle=end + chat.final")
+        # Send presence idle to unlock R1 input for next message
+        await ws.send(json.dumps({
+            "type": "event",
+            "event": "presence",
+            "seq": next_seq_fn(),
+            "payload": {
+                "status": "idle",
+                "deviceId": device_id,
+                "ts": end_ts,
+            },
+        }))
     except Exception as e:
         log(f"❌ Hermes API error: {e}")
         now_ts = int(time.time() * 1000)
@@ -440,17 +455,17 @@ async def _handle_chat_send_stream(ws, request_id: str, params: dict, device_id:
             },
         }))
         # ── Send chat.final (error) so R1 accepts next message ──
+        err_seq = next_seq_fn()
         await ws.send(json.dumps({
             "type": "event",
             "event": "chat",
-            "seq": next_seq_fn(),
+            "seq": err_seq,
             "payload": {
-                "id": run_id,
                 "runId": run_id,
-                "state": "error",
                 "sessionKey": session_key,
-                "endedAt": now_ts,
-                "error": str(e),
+                "seq": err_seq,
+                "state": "error",
+                "errorMessage": str(e),
             },
         }))
         log("  → Sent: chat.final (error)")
